@@ -22,14 +22,18 @@ PythonVersion : float
 mdfinfo3 module
 --------------------------
 """
-from sys import version_info
+from __future__ import print_function
+
+from sys import version_info, stderr
 PythonVersion = version_info
 PythonVersion = PythonVersion[0]
 from numpy import sort, zeros
 from struct import calcsize, unpack
+from collections import defaultdict
+from mdf import dataField, descriptionField, unitField, masterField, masterTypeField
 
 
-class info3(dict):
+class info3(defaultdict):
 
     """ mdf file info class version 3.x
     MDFINFO is a class information about an MDF (Measure Data Format) file
@@ -72,12 +76,12 @@ class info3(dict):
         --------
         If fileName is given it will read file blocks directly by calling method readinfo3
         """
-        self['IDBlock'] = {}  # Identifier Block
-        self['HDBlock'] = {}  # Header Block
-        self['DGBlock'] = {}  # Data Group Block
-        self['CGBlock'] = {}  # Channel Group Block
-        self['CNBlock'] = {}  # Channel Block
-        self['CCBlock'] = {}  # Conversion block
+        self['IDBlock'] = defaultdict()  # Identifier Block
+        self['HDBlock'] = defaultdict()  # Header Block
+        self['DGBlock'] = defaultdict()  # Data Group Block
+        self['CGBlock'] = defaultdict()  # Channel Group Block
+        self['CNBlock'] = defaultdict()  # Channel Block
+        self['CCBlock'] = defaultdict()  # Conversion block
         self.filterChannelNames = filterChannelNames
         self.fileName = fileName
         if fileName is not None and fid is None:
@@ -101,10 +105,8 @@ class info3(dict):
         fid.seek(24)
         self['IDBlock']['ByteOrder'] = unpack('<H', fid.read(2))
         self['IDBlock']['FloatingPointFormat'] = unpack('<H', fid.read(2))
-        self['IDBlock']['id_ver'] = unpack('<H', fid.read(2))
-        self['IDBlock']['id_ver'] = self['IDBlock']['id_ver'][0]
-        self['IDBlock']['CodePageNumber'] = unpack('<H', fid.read(2))
-        self['IDBlock']['CodePageNumber'] = self['IDBlock']['CodePageNumber'][0]
+        self['IDBlock']['id_ver'] = unpack('<H', fid.read(2))[0]
+        self['IDBlock']['CodePageNumber'] = unpack('<H', fid.read(2))[0]
 
         # Read header block (HDBlock) information
         # Read Header block info into structure, HD pointer at 64 as mentioned in specification
@@ -130,12 +132,12 @@ class info3(dict):
 
             # Read data Channel Group block info into structure
             CGpointer = self['DGBlock'][dataGroup]['pointerToNextCGBlock']
-            self['CGBlock'][dataGroup] = {}
-            self['CNBlock'][dataGroup] = {}
-            self['CCBlock'][dataGroup] = {}
+            self['CGBlock'][dataGroup] = defaultdict()
+            self['CNBlock'][dataGroup] = defaultdict()
+            self['CCBlock'][dataGroup] = defaultdict()
             for channelGroup in range(self['DGBlock'][dataGroup]['numberOfChannelGroups']):
-                self['CNBlock'][dataGroup][channelGroup] = {}
-                self['CCBlock'][dataGroup][channelGroup] = {}
+                self['CNBlock'][dataGroup][channelGroup] = defaultdict()
+                self['CCBlock'][dataGroup][channelGroup] = defaultdict()
                 self['CGBlock'][dataGroup][channelGroup] = self.mdfblockread3(self.blockformats3('CGFormat'), fid, CGpointer)
                 CGpointer = self['CGBlock'][dataGroup][channelGroup]['pointerToNextCGBlock']
 
@@ -147,6 +149,7 @@ class info3(dict):
                 # Get pointer to next first Channel block
                 CNpointer = self['CGBlock'][dataGroup][channelGroup]['pointerToFirstCNBlock']
 
+                snames = set()
                 # For each Channel
                 for channel in range(self['CGBlock'][dataGroup][channelGroup]['numberOfChannels']):
 
@@ -162,6 +165,7 @@ class info3(dict):
                     # Clean signal name
                     shortSignalName = self['CNBlock'][dataGroup][channelGroup][channel]['signalName']  # short name of signal
                     CNTXpointer = self['CNBlock'][dataGroup][channelGroup][channel]['pointerToASAMNameBlock']
+
                     if CNTXpointer > 0:
                         longSignalName = self.mdfblockread3(self.blockformats3('TXFormat'), fid, CNTXpointer)  # long name of signal
                         longSignalName = longSignalName['Text']
@@ -177,8 +181,13 @@ class info3(dict):
                     signalname = signalname[0]
                     if self.filterChannelNames:
                         signalname = signalname.split('.')[-1]  # filters channels modules
-                    self['CNBlock'][dataGroup][channelGroup][channel]['signalName'] = signalname
-                    #self.channelNameList.append( signalname )
+
+                    if signalname in snames:
+                        self['CNBlock'][dataGroup][channelGroup][channel]['signalName'] = signalname + '_' + str(channel)
+                        print('WARNING added number to duplicate channel name: ' + self['CNBlock'][dataGroup][channelGroup][channel]['signalName'], file=stderr)
+                    else:
+                        self['CNBlock'][dataGroup][channelGroup][channel]['signalName'] = signalname
+                    snames.add(self['CNBlock'][dataGroup][channelGroup][channel]['signalName'])
 
                     # Read channel description
                     CNTXpointer = self['CNBlock'][dataGroup][channelGroup][channel]['pointerToChannelCommentBlock']
@@ -302,7 +311,7 @@ class info3(dict):
 
                             # Give warning that conversion formula is not being
                             # made
-                            print(('Conversion Formula type (cc_type=' + str(self['CCBlock'][dataGroup][channelGroup][channel]['cc_type']) + ')not supported.'))
+                            print(('Conversion Formula type (cc_type=' + str(self['CCBlock'][dataGroup][channelGroup][channel]['cc_type']) + ')not supported.'), file=stderr)
 
         # CLose the file
         fid.close()
@@ -312,7 +321,7 @@ class info3(dict):
         # as it will not use cn_byte_offset
         # first, calculate new mapping/order
         for dg in range(self['HDBlock']['numberOfDataGroups']):
-            for cg in range(self['DGBlock'][dataGroup]['numberOfChannelGroups']):
+            for cg in range(self['DGBlock'][dg]['numberOfChannelGroups']):
                 nChannel = len(self['CNBlock'][dg][cg])
                 Map = zeros(shape=len(self['CNBlock'][dg][cg]), dtype=[('index', 'u4'), ('first_bit', 'u4')])
                 for cn in range(nChannel):
@@ -331,7 +340,7 @@ class info3(dict):
                         self['CNBlock'][dg][cg][cn] = self['CNBlock'][dg][cg].pop(orderedMap[cn][0] + nChannel)
                         self['CCBlock'][dg][cg][cn] = self['CCBlock'][dg][cg].pop(orderedMap[cn][0] + nChannel)
 
-    def listChannels3(self, fileName=None):
+    def listChannels3(self, fileName=None, fid=None):
         """ reads data, channel group and channel blocks to list channel names
 
         Attributes
@@ -347,7 +356,8 @@ class info3(dict):
         if fileName is not None:
             self.fileName = fileName
         # Open file
-        fid = open(self.fileName, 'rb')
+        if fid is None and fileName is not None:
+            fid = open(self.fileName, 'rb')
         channelNameList = []
 
         # Read header block (HDBlock) information
@@ -382,6 +392,7 @@ class info3(dict):
                 # Get pointer to next first Channel block
                 CNpointer = self['CGBlock'][dataGroup][channelGroup]['pointerToFirstCNBlock']
 
+                snames = set()
                 # For each Channel
                 for channel in range(self['CGBlock'][dataGroup][channelGroup]['numberOfChannels']):
 
@@ -409,7 +420,14 @@ class info3(dict):
                     signalname = signalname[0]
                     if self.filterChannelNames:
                         signalname = signalname.split('.')[-1]
-                    self['CNBlock'][dataGroup][channelGroup][channel]['signalName'] = signalname
+
+                    if signalname in snames:
+                        self['CNBlock'][dataGroup][channelGroup][channel]['signalName'] = signalname + '_' + str(channel)
+                        print('WARNING added number to duplicate signal name: ' + self['CNBlock'][dataGroup][channelGroup][channel]['signalName'], file=stderr)
+                    else:
+                        self['CNBlock'][dataGroup][channelGroup][channel]['signalName'] = signalname
+                        snames.add(signalname)
+
                     channelNameList.append(signalname)
 
         # CLose the file
@@ -592,7 +610,7 @@ class info3(dict):
                 (UINT16, 1, 'VersionNumber'),
                 (UINT16, 1, 'CodePageNumber'))
         else:
-            print('Block format name error ')
+            print('Block format name error ', file=stderr)
         return formats
 
     #######mdfblockread3####################
@@ -637,7 +655,7 @@ class info3(dict):
                             Block[fieldName] = value.decode('latin1', 'replace').encode('utf-8').rstrip('\x00')
                         else:
                             Block[fieldName] = value.decode('latin1', 'replace').encode('utf-8')
-                    else:
+                    elif value:
                         if removeTrailing0:
                             Block[fieldName] = value.decode('latin1', 'replace').rstrip('\x00')  # decode bytes
                         else:
@@ -651,3 +669,56 @@ class info3(dict):
                     else:
                         Block[fieldName] = None
             return Block
+
+def _generateDummyMDF3(info, channelList):
+    """ computes MasterChannelList and mdf dummy dict from an info object
+
+    Parameters
+    ----------------
+    info : info object
+        information structure of file
+
+    channelList : list of str
+        list of channel names
+
+    Returns
+    -----------
+    a dict which keys are master channels in files with values a list of related channels of the raster
+    """
+    MasterChannelList = {}
+    allChannelList = set()
+    mdfdict = {}
+    for dg in info['DGBlock']:
+            master = ''
+            mastertype = 0
+            for cg in info['CGBlock'][dg]:
+                channelNameList = []
+                for cn in info['CNBlock'][dg][cg]:
+                    name = info['CNBlock'][dg][cg][cn]['signalName']
+                    if name in allChannelList or \
+                            info['CNBlock'][dg][cg][cn]['channelType']:
+                        name += '_' + str(dg)
+                    if channelList is None or name in channelList:
+                        channelNameList.append(name)
+                        allChannelList.add(name)
+                        # create mdf channel
+                        mdfdict[name] = {}
+                        mdfdict[name][dataField] = None
+                        if 'signalDescription' in info['CNBlock'][dg][cg][cn]:
+                            mdfdict[name][descriptionField] = info['CNBlock'][dg][cg][cn]['signalDescription']
+                        else:
+                            mdfdict[name][descriptionField] = ''
+                        if 'physicalUnit' in info['CCBlock'][dg][cg][cn]:
+                            mdfdict[name][unitField] = info['CCBlock'][dg][cg][cn]['physicalUnit']
+                        else:
+                            mdfdict[name][unitField] = ''
+                        mdfdict[name][masterField] = 0 # default is time
+                        mdfdict[name][masterTypeField] = None
+                    if info['CNBlock'][dg][cg][cn]['channelType']: # master channel of cg
+                        master = name
+                        mastertype = info['CNBlock'][dg][cg][cn]['channelType']
+                for chan in channelNameList:
+                    mdfdict[chan][masterField] = master
+                    mdfdict[chan][masterTypeField] = mastertype
+            MasterChannelList[master] = channelNameList
+    return (MasterChannelList, mdfdict)

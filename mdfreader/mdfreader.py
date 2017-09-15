@@ -31,22 +31,24 @@ PythonVersion : float
 mdfreader module
 --------------------------
 """
+from __future__ import print_function
+
 from io import open
 from struct import unpack
 from math import ceil
-try:
-    from .mdf3reader import mdf3
-    from .mdf4reader import mdf4
-except:
-    from mdf3reader import mdf3
-    from mdf4reader import mdf4
+from os.path import dirname, abspath, splitext
+from os import remove
+from sys import version_info, stderr, path
+_root = dirname(abspath(__file__))
+path.append(_root)
+from datetime import datetime
+from argparse import ArgumentParser
+from mdf3reader import mdf3
+from mdf4reader import mdf4
+from mdf import _open_MDF, dataField, descriptionField, unitField, masterField, masterTypeField
 from numpy import arange, linspace, interp, all, diff, mean, vstack, hstack, float64, zeros, empty, delete
 from numpy import nan, datetime64, array
-from datetime import datetime
 
-from argparse import ArgumentParser
-from sys import version_info
-from os.path import splitext
 PythonVersion = version_info
 PythonVersion = PythonVersion[0]
 
@@ -68,7 +70,7 @@ def _convertMatlabName(channel):
         try:
             channel = channel.decode('utf-8')
         except:
-            print('channel name can not be decoded : ' + channel)
+            print('channel name can not be decoded : ' + channel, file=stderr)
     channelName = channel.replace('[', '_ls_')
     channelName = channelName.replace(']', '_rs_')
     channelName = channelName.replace('$', '')
@@ -111,6 +113,12 @@ class mdfinfo(dict):
         file name
     mdfversion : int
         mdf file version number
+    filterChannelNames : bool
+        flag to filter long channel names including module names separated by a '.'
+    fid
+        file identifier
+    zipfile : Bool
+        flag to identify compressed file in pkzip, .mfxz extension
 
     Methods
     ------------
@@ -125,11 +133,11 @@ class mdfinfo(dict):
     >>> FILENAME='toto.dat'
     >>> yop=mdfreader.mdfinfo(FILENAME)
     or if you are just interested to have only list of channels
-    >>> yop=mdfreader.mdfinfo() # creates new instance f mdfinfo class
-    >>> yop=mdfreader.listChannels(FILENAME) # returns a simple list of channel names
+    >>> yop=mdfreader.mdfinfo() # creates new instance of mdfinfo class
+    >>> yop.listChannels(FILENAME) # returns a simple list of channel names
     """
 
-    def __init__(self, fileName=None, filterChannelNames=False):
+    def __init__(self, fileName=None, filterChannelNames=False, fid=None):
 
         """ You can give optionally to constructor a file name that will be parsed
 
@@ -139,14 +147,19 @@ class mdfinfo(dict):
             file name
         filterChannelNames : bool, optional
             flag to filter long channel names including module names separated by a '.'
+        fid : file identifier, optional
         """
 
         self.fileName = fileName
-        self.mdfversion = 0
+        self.filterChannelNames = filterChannelNames
+        self.mdfversion = 410
+        self.fid = fid
+        self.zipfile = False
         if fileName is not None:
-            self.readinfo(fileName, filterChannelNames)
+            self.readinfo(fileName, fid)
 
-    def readinfo(self, fileName=None, filterChannelNames=False):
+
+    def readinfo(self, fileName=None, fid=None):
 
         """ Reads MDF file and extracts its complete structure
 
@@ -154,27 +167,28 @@ class mdfinfo(dict):
         ----------------
         fileName : str, optional
             file name. If not input, uses fileName attribute
-        filterChannelNames : bool, optional
-            flag to filter long channel names including module names separated by a '.'
+        fid : file identifier, optional
         """
 
-        if self.fileName is None:
+        if self.fileName is None or fileName is not None:
             self.fileName = fileName
+
         # Open file
-        try:
-            fid = open(self.fileName, 'rb')
-        except IOError:
-            raise Exception('Can not find file ' + self.fileName)
+        if self.fid is None or (self.fid is not None and self.fid.closed):
+            (self.fid, self.fileName, self.zipfile) = _open_MDF(self.fileName)
+
         # read Identifier block
-        fid.seek(28)
-        MDFVersionNumber = unpack('<H', fid.read(2))
+        self.fid.seek(28)
+        MDFVersionNumber = unpack('<H', self.fid.read(2))
         self.mdfversion = MDFVersionNumber[0]
         if self.mdfversion < 400:  # up to version 3.x not compatible with version 4.x
-            from .mdfinfo3 import info3
-            self.update(info3(None, fid, filterChannelNames))
+            from mdfinfo3 import info3
+            self.update(info3(None, self.fid, self.filterChannelNames))
         else:  # MDF version 4.x
-            from .mdfinfo4 import info4
-            self.update(info4(None, fid))
+            from mdfinfo4 import info4
+            self.update(info4(None, self.fid))
+            if self.zipfile and fid is None: # not from mdfreader.read()
+                remove(self.fileName)
 
     def listChannels(self, fileName=None):
 
@@ -191,26 +205,40 @@ class mdfinfo(dict):
             list of channel names
         """
 
-        if self.fileName is None:
+        if self.fileName is None or fileName is not None:
             self.fileName = fileName
         # Open file
-        try:
-            fid = open(self.fileName, 'rb')
-        except IOError:
-            raise Exception('Can not find file ' + self.fileName)
+        (self.fid, self.fileName, zipfile) = _open_MDF(self.fileName)
         # read Identifier block
-        fid.seek(28)
-        MDFVersionNumber = unpack('<H', fid.read(2))
+        self.fid.seek(28)
+        MDFVersionNumber = unpack('<H', self.fid.read(2))
         self.mdfversion = MDFVersionNumber[0]
         if self.mdfversion < 400:  # up to version 3.x not compatible with version 4.x
-            from .mdfinfo3 import info3
+            from mdfinfo3 import info3
             channelNameList = info3()
-            nameList = channelNameList.listChannels3(self.fileName)
+            nameList = channelNameList.listChannels3(self.fileName, self.fid)
         else:
-            from .mdfinfo4 import info4
+            from mdfinfo4 import info4
             channelNameList = info4()
-            nameList = channelNameList.listChannels4(self.fileName)
+            nameList = channelNameList.listChannels4(self.fileName, self.fid)
+            if zipfile: # not from mdfreader.read()
+                remove(self.fileName)
         return nameList
+
+    def _generateDummyMDF(self, channelList=None):
+        """ Parse MDF file structure and create a dummy mdf object structure
+
+        Parameters
+        ----------------
+        channelList : str, optional
+            list of channels
+        """
+        if self.mdfversion < 400:  # up to version 3.x not compatible with version 4.x
+            from mdfinfo3 import _generateDummyMDF3
+            return _generateDummyMDF3(self, channelList)
+        else:  # MDF version 4.x
+            from mdfinfo4 import _generateDummyMDF4
+            return _generateDummyMDF4(self, channelList)
 
 
 class mdf(mdf3, mdf4):
@@ -234,10 +262,10 @@ class mdf(mdf3, mdf4):
 
     Methods
     ------------
-    read( fileName = None, multiProc = False, channelList=None, convertAfterRead=True, filterChannelNames=False )
+    read( fileName = None, multiProc = False, channelList=None, convertAfterRead=True, filterChannelNames=False, noDataLoading=False, compression=False)
         reads mdf file version 3.x and 4.x
     write( fileName=None )
-        writes simple mdf 3.3 file
+        writes simple mdf file
     getChannelData( channelName )
         returns channel numpy array
     convertAllChannel()
@@ -284,7 +312,8 @@ class mdf(mdf3, mdf4):
     >>> import mdfreader
     >>> yop=mdfreader.mdf('NameOfFile')
     >>> yop.keys() # list channels names
-    >>> yop.masterChannelList() # list channels grouped by raster or master channel
+    # list channels grouped by raster or master channel
+    >>> yop.masterChannelList()
     >>> yop.plot('channelName') or yop.plot({'channel1','channel2'})
     >>> yop.resample(0.1) or yop.resample(channelName='master3')
     >>> yop.exportoCSV(sampling=0.01)
@@ -294,11 +323,15 @@ class mdf(mdf3, mdf4):
     >>> yop.exporttoExcel()
     >>> yop.exporttoXlsx()
     >>> yop.convertToPandas() # converts data groups into pandas dataframes
-    >>> yop.keepChannels({'channel1','channel2','channel3'}) # drops all the channels except the one in argument
+    >>> yop.write() # writes mdf file
+    # drops all the channels except the one in argument
+    >>> yop.keepChannels({'channel1','channel2','channel3'})
     >>> yop.getChannelData('channelName') # returns channel numpy array
     """
 
-    def read(self, fileName=None, multiProc=False, channelList=None, convertAfterRead=True, filterChannelNames=False):
+    def read(self, fileName=None, multiProc=False, channelList=None,
+             convertAfterRead=True, filterChannelNames=False,
+             noDataLoading=False, compression=False):
         """ reads mdf file version 3.x and 4.x
 
         Parameters
@@ -322,6 +355,15 @@ class mdf(mdf3, mdf4):
         filterChannelNames : bool, optional
             flag to filter long channel names from its module names separated by '.'
 
+        noDataLoading : bool, optional
+            Flag to read only file info but no data to have minimum memory use
+
+        compression : bool or str, optional
+            To compress data in memory using blosc or bcolz, takes cpu time
+            if compression = int(1 to 9), uses bcolz for compression
+            if compression = 'blosc', uses blosc for compression
+            Choice given, efficiency depends of data
+
         Notes
         --------
         If you keep convertAfterRead to true, you can set attribute mdf.multiProc to activate channel conversion in multiprocessing.
@@ -335,19 +377,27 @@ class mdf(mdf3, mdf4):
         if self.fileName is None:
             self.fileName = fileName
 
-        print(self.fileName)
+        # print(self.fileName, file=stderr)  # you can uncomment to show the file process from a batch
 
         # read file blocks
         info = mdfinfo(self.fileName, filterChannelNames)
-
         self.MDFVersionNumber = info.mdfversion
-        if self.MDFVersionNumber < 400:  # up to version 3.x not compatible with version 4.x
-            self.read3(self.fileName, info, multiProc, channelList, convertAfterRead, filterChannelNames=False)
-        else:  # MDF version 4.x. Channel by channel reading implemented
-            self.read4(self.fileName, info, multiProc, channelList, convertAfterRead, filterChannelNames=False)
+
+        if not noDataLoading:
+            if self.MDFVersionNumber < 400:  # up to version 3.x not compatible with version 4.x
+                self.read3(self.fileName, info, multiProc, channelList,
+                           convertAfterRead, filterChannelNames, compression)
+            else:  # MDF version 4.x
+                self.read4(self.fileName, info, multiProc, channelList,
+                           convertAfterRead, filterChannelNames, compression)
+        else:  # populate minimum mdf structure
+            self._noDataLoading = True
+            self._info = info
+            (self.masterChannelList, mdfdict) = self._info._generateDummyMDF(channelList)
+            self.update(mdfdict)
 
     def write(self, fileName=None):
-        """Writes simple mdf 3.3 file
+        """Writes simple mdf file, same format as originally read, default is 4.x
 
         Parameters
         ----------------
@@ -361,12 +411,17 @@ class mdf(mdf3, mdf4):
         """
         if fileName is None:
             splitName = splitext(self.fileName)
+            if splitName[-1] in ('.mfxz', '.MFXZ'):
+                splitName[-1] = '.mfx'  # do not resave in compressed file
             self.fileName = splitName[-2] + '_New' + splitName[-1]
         else:
             self.fileName = fileName
         # makes sure all channels are converted
         self.convertAllChannel()
-        self.write3(fileName=self.fileName)
+        if self.MDFVersionNumber < 400:
+            self.write3(fileName=self.fileName)
+        else:
+            self.write4(fileName=self.fileName)
 
     def getChannelData(self, channelName):
         """Return channel numpy array
@@ -448,7 +503,7 @@ class mdf(mdf3, mdf4):
                     plt.grid(True)
                     plt.show()
             else:
-                print(('Channel ' + channelName + ' not existing'))
+                print(('Channel ' + channelName + ' not existing'), file=stderr)
 
     def allPlot(self):
         # plot all channels in the object, be careful for test purpose only,
@@ -457,7 +512,7 @@ class mdf(mdf3, mdf4):
             try:
                 self.plot(Name)
             except:
-                print(Name)
+                print(Name, file=stderr)
 
     def resample(self, samplingTime=None, masterChannel=None):
         """ Resamples all data groups into one data group having defined
@@ -483,7 +538,7 @@ class mdf(mdf3, mdf4):
         2. resampling will convert all your channels so be careful for big files
         and memory consumption
         """
-        if self: # mdf contains data 
+        if self: # mdf contains data
             # must make sure all channels are converted
             self.convertAllChannel()
             masterData = None
@@ -496,7 +551,8 @@ class mdf(mdf3, mdf4):
                     if master is not None and master != '' and \
                             master in self and self.masterChannelList[master]:
                         masterData = self.getChannelData(master)
-                        if master in self and len(masterData) > 5:  # consider groups having minimum size
+                        # consider groups having minimum size
+                        if master in self and len(masterData) > 5:
                             minTime.append(masterData[0])
                             maxTime.append(masterData[-1])
                             length.append(len(masterData))
@@ -515,11 +571,12 @@ class mdf(mdf3, mdf4):
             else:
                 masterChannelName = masterChannel # master channel defined in argument
                 if masterChannel not in list(self.masterChannelList.keys()):
-                    print('master channel name not in existing')
+                    print('master channel name not in existing', file=stderr)
                     raise
             # resample all channels to one sampling time vector
             if len(list(self.masterChannelList.keys())) > 1:  # Not yet resampled or only 1 datagroup
-                if masterChannel is None and masterData is not None:  # create master channel if not proposed
+                # create master channel if not proposed
+                if masterChannel is None and masterData is not None:
                     self.add_channel(0, masterChannelName, \
                         masterData, \
                         masterChannelName, \
@@ -538,17 +595,20 @@ class mdf(mdf3, mdf4):
                             timevect = self.getChannelData(self.getChannelMaster(Name))
                             if not self.getChannelData(Name).dtype.kind in ('S', 'U'):  # if channel not array of string
                                 self.setChannelData(Name, interp(masterData, timevect, self.getChannelData(Name)))
+                                self.setChannelMaster(Name, masterChannelName)
+                                self.setChannelMasterType(Name, self.getChannelMasterType(master))
+                                self.remove_channel_conversion(Name)
                             else:  # can not interpolate strings, remove channel containing string
                                 self.remove_channel(Name)
                     except:
                         if len(timevect) != len(self.getChannelData(Name)):
-                            print((Name + ' and master channel ' + self.getChannelMaster(Name) + ' do not have same length'))
+                            print((Name + ' and master channel ' + self.getChannelMaster(Name) + ' do not have same length'), file=stderr)
                         elif not all(diff(timevect) > 0):
-                            print((Name + ' has non regularly increasing master channel ' + self.getChannelMaster(Name)))
+                            print((Name + ' has non regularly increasing master channel ' + self.getChannelMaster(Name)), file=stderr)
                 # remove time channels in masterChannelList
                 for ind in list(self.masterChannelList.keys()):
                     if ind != masterChannelName and ind in self:
-                        del self[ind]
+                        self.remove_channel(ind)
                 self.masterChannelList = {}  # empty dict
                 self.masterChannelList[masterChannelName] = list(self.keys())
             elif len(list(self.masterChannelList.keys())) == 1 and samplingTime is not None: # resamples only 1 datagroup
@@ -557,10 +617,13 @@ class mdf(mdf3, mdf4):
                 for Name in list(self.keys()):
                     timevect = self.getChannelData(self.getChannelMaster(Name))
                     self.setChannelData(Name, interp(masterData, timevect, self.getChannelData(Name)))
+                    self.setChannelMaster(Name, masterChannelName)
+                    self.setChannelMasterType(Name, self.getChannelMasterType(master))
+                    self.remove_channel_conversion(Name)
             elif samplingTime is None:
-                print('Already resampled')
+                print('Already resampled', file=stderr)
         else:
-            print('no data to be resampled')
+            print('no data to be resampled', file=stderr)
 
     def exportToCSV(self, filename=None, sampling=None):
         """Exports mdf data into CSV file
@@ -585,36 +648,50 @@ class mdf(mdf3, mdf4):
             if filename is None:
                 filename = splitext(self.fileName)[0]
                 filename = filename + '.csv'
-            if PythonVersion < 3:
-                f = open(filename, "wb")
+            if self.MDFVersionNumber >= 400:
+                encoding = 'utf8' # mdf4 encoding is unicode
             else:
-                f = open(filename, "wt", encoding='latin-1')
-            writer = csv.writer(f, dialect=csv.excel)
+                encoding = 'latin-1' # mdf3 encoding is latin-1
             # writes header
-            writer.writerow([name for name in list(self.keys()) \
-                    if self.getChannelData(name).dtype.kind not in ('S', 'U', 'V') \
-                    and self.getChannelData(name).ndim <= 1])  # writes channel names
             if PythonVersion < 3:
                 units = []
+                names = []
+                f = open(filename, "wb")
+                writer = csv.writer(f, dialect=csv.excel)
                 for name in list(self.keys()):
                     data = self.getChannelData(name)
+                    unit = self.getChannelUnit(name)
                     if data.dtype.kind not in ('S', 'U', 'V') \
                             and data.ndim <= 1:
-                        if self.getChannelUnit(name) is bytes:
-                            units.append(self.getChannelUnit(name).encode('unicode', 'ignore'))
+                        if name is bytes:
+                            names.append(name.encode(encoding, 'ignore'))
                         else:
                             try:
-                                units.append(self.getChannelUnit(name).encode('latin-1','replace'))
+                                names.append(name.encode(encoding, 'replace'))
                             except:
-                                units.append(self.getChannelUnit(name))
+                                names.append(name)
+                        if self.getChannelUnit(name) is bytes:
+                            units.append(unit.encode(encoding, 'ignore'))
+                        else:
+                            try:
+                                units.append(unit.encode(encoding, 'replace'))
+                            except:
+                                units.append(unit)
+                writer.writerow(names) # writes channel names
                 writer.writerow(units)  # writes units
             else:
+                f = open(filename, "wt", encoding=encoding)
+                writer = csv.writer(f, dialect=csv.excel)
+                writer.writerow([name for name in list(self.keys()) \
+                        if self.getChannelData(name).dtype.kind not in ('S', 'U', 'V') \
+                        and self.getChannelData(name).ndim <= 1])  # writes channel names
+                # writes units
                 writer.writerow([self.getChannelUnit(name) \
-                        for name in list(self.keys()) 
+                        for name in list(self.keys())
                         if self.getChannelData(name).dtype.kind not in ('S', 'U', 'V') \
                         and self.getChannelData(name).ndim <= 1])  # writes units
             # concatenate all channels
-            temp=[]
+            temp = []
             for name in list(self.keys()):
                 data = self.getChannelData(name)
                 if data.dtype.kind not in ('S', 'U', 'V') \
@@ -628,7 +705,7 @@ class mdf(mdf3, mdf4):
                 writer.writerows([list(buf[i, :]) for i in range(r)])
             f.close()
         else:
-            print('no data to be exported')
+            print('no data to be exported', file=stderr)
 
     def exportToNetCDF(self, filename=None, sampling=None):
         """Exports mdf data into netcdf file
@@ -701,7 +778,7 @@ class mdf(mdf3, mdf4):
             else:
                 dataType = None
                 print(('Can not process numpy type ' + str(data.dtype)\
-                     + ' of channel ' + name))
+                     + ' of channel ' + name), file=stderr)
             if dataType is not None:
                 # create variable
                 CleanedName = cleanName(name)
@@ -713,7 +790,7 @@ class mdf(mdf3, mdf4):
                 setAttribute(var[name], 'title', CleanedName)
                 setAttribute(var[name], 'units', self.getChannelUnit(name))
                 setAttribute(var[name], 'Description', self.getChannelDesc(name))
-                if name in list(self.masterChannelList.keys()):
+                if name in set(self.masterChannelList.keys()):
                     setAttribute(var[name], 'Type', 'Master Channel')
                     setAttribute(var[name], 'datatype', 'master')
                 else:
@@ -766,7 +843,8 @@ class mdf(mdf3, mdf4):
             filename = splitext(self.fileName)[0]
             filename = filename + '.hdf'
         f = h5py.File(filename, 'w')  # create hdf5 file
-        filegroup = f.create_group(os.path.basename(filename))  # create group in root associated to file
+        # create group in root associated to file
+        filegroup = f.create_group(os.path.basename(filename))
         setAttribute(filegroup, 'Author', self.file_metadata['author'])
         setAttribute(filegroup, 'Date', self.file_metadata['date'])
         setAttribute(filegroup, 'Time', self.file_metadata['time'])
@@ -775,6 +853,7 @@ class mdf(mdf3, mdf4):
         setAttribute(filegroup, 'ProjectName', self.file_metadata['project'])
         setAttribute(filegroup, 'Subject', self.file_metadata['subject'])
         setAttribute(filegroup, 'Comment', self.file_metadata['comment'])
+        masterTypeDict = {0:'None', 1:'Time', 2:'Angle', 3:'Distance', 4:'Index', None:'None'}
         if len(list(self.masterChannelList.keys())) > 1:
             # if several time groups of channels, not resampled
             groups = {}
@@ -783,32 +862,38 @@ class mdf(mdf3, mdf4):
             for channel in list(self.keys()):
                 channelData = self.getChannelData(channel)
                 masterName = self.getChannelMaster(channel)
-                if 'master' in self[channel] and masterName not in list(groups.keys()):
+                if masterField in self[channel] and masterName not in list(groups.keys()):
                     # create new data group
                     ngroups += 1
-                    if masterName!='' \
+                    if masterName != '' \
                             and masterName is not None:
                         group_name = masterName
                     else:
-                        group_name = 'master'+str(ngroups)
+                        group_name = masterField+str(ngroups)
                     groups[group_name] = ngroups
                     grp[ngroups] = filegroup.create_group(group_name)
-                elif 'master' in self[channel] and masterName in list(groups.keys()):
+                    setAttribute(grp[ngroups], masterField, masterName)
+                    setAttribute(grp[ngroups], masterTypeField, \
+                            masterTypeDict[self.getChannelMasterType(channel)])
+                elif masterField in self[channel] and masterName in list(groups.keys()):
                     group_name = masterName
                 if channelData.dtype.kind not in ('U', 'O'):  # not supported type
                     dset = grp[groups[group_name]].create_dataset(channel, data=channelData)
-                    setAttribute(dset, 'unit', self.getChannelUnit(channel))
-                    if 'description' in self[channel]:
-                        setAttribute(dset, 'description', self.getChannelDesc(channel))
+                    setAttribute(dset, unitField, self.getChannelUnit(channel))
+                    if descriptionField in self[channel]:
+                        setAttribute(dset, descriptionField, self.getChannelDesc(channel))
         else:  # resampled or only one time for all channels : no groups
+            masterName = list(self.masterChannelList.keys())[0]
+            setAttribute(filegroup, masterField, masterName)
+            setAttribute(filegroup, masterTypeField, \
+                    masterTypeDict[self.getChannelMasterType(masterName)])
             for channel in list(self.keys()):
                 channelData = self.getChannelData(channel)
                 if channelData.dtype.kind not in ('U', 'O'):  # not supported type
-                    channelName = _convertMatlabName(channel)
-                    dset = filegroup.create_dataset(channelName, data=channelData)
-                    setAttribute(dset, 'unit', self.getChannelUnit(channel))
-                    if 'description' in self[channel]:
-                        setAttribute(dset, 'description', self.getChannelDesc(channel))
+                    dset = filegroup.create_dataset(channel, data=channelData)
+                    setAttribute(dset, unitField, self.getChannelUnit(channel))
+                    if descriptionField in self[channel]:
+                        setAttribute(dset, descriptionField, self.getChannelDesc(channel))
         f.close()
 
     def exportToMatlab(self, filename=None):
@@ -827,7 +912,8 @@ class mdf(mdf3, mdf4):
         --------
         This method will dump all data into Matlab file but you will loose below information:
         - unit and descriptions of channel
-        - data structure, what is corresponding master channel to a channel. Channels might have then different lengths
+        - data structure, what is corresponding master channel to a channel.
+            Channels might have then different lengths
         """
         # export class data struture into .mat file
         try:
@@ -843,7 +929,10 @@ class mdf(mdf3, mdf4):
             data = self.getChannelData(channel)
             if data.dtype.kind not in ('S', 'U', 'V'):  # does not like special characters chains, skip
                 channelName = _convertMatlabName(channel)
-                temp[channelName] = data
+                if len(channelName) > 0  and channelName is not None:
+                    temp[channelName] = data
+                elif channelName is not None:
+                    print('Could not export ' + channel + ', name is not compatible with Matlab')
         try:  # depends of version used , compression can be used
             savemat(filename, temp, long_field_names=True, format='5', do_compression=True, oned_as='column')
         except:
@@ -864,9 +953,9 @@ class mdf(mdf3, mdf4):
 
         Notes
         --------
-        xlwt is not fast for even for small files, consider other binary formats like HDF5 or Matlab
+        xlwt is not fast even for small files, consider other binary formats like HDF5 or Matlab
         If there are more than 256 channels, data will be saved over different worksheets
-        Also Excel 203 is becoming rare these days
+        Also Excel 2003 is becoming rare these days, prefer using exportToXlsx
         """
         try:
             if PythonVersion < 3:
@@ -923,8 +1012,8 @@ class mdf(mdf3, mdf4):
                     tooLongChannels.append(channelList[col])  # to later warn user the channel is not completely written
         wb.save(filename)  # writes workbook on HDD
         if len(tooLongChannels) > 0:  # if not empty, some channels have been not processed
-            print('Following channels were too long to be processed completely, maybe you should resample : ')
-            print(tooLongChannels)
+            print('Following channels were too long to be processed completely, maybe you should resample : ', file=stderr)
+            print(tooLongChannels, file=stderr)
 
     def exportToXlsx(self, filename=None):
         """Exports mdf data into excel 2007 and 2010 file
@@ -944,17 +1033,20 @@ class mdf(mdf3, mdf4):
         """
         try:
             import openpyxl
+            from openpyxl.utils.exceptions import IllegalCharacterError
         except:
             raise ImportError('Module openpyxl missing')
         if filename is None:
             filename = splitext(self.fileName)[0]
             filename = filename + '.xlsx'
         channels = list(self.keys())
-        maxRows = max([len(self.getChannelData(channel)) for channel in list(self.keys())])  # find max column length
-        maxCols = len(list(self.keys()))  # number of columns
-        print('Creating Excel sheet')
-        if len(list(self.masterChannelList.keys())) > 1:  # not resampled data, can be long, writing cell by cell !
-            wb = openpyxl.workbook.Workbook(encoding='utf-8')
+        # find max column length
+        maxRows = max([len(self.getChannelData(channel)) for channel in channels])
+        maxCols = len(channels)  # number of columns
+        print('Creating Excel sheet', file=stderr)
+        # not resampled data, can be long, writing cell by cell !
+        if len(list(self.masterChannelList.keys())) > 1:
+            wb = openpyxl.workbook.Workbook()
             ws = wb.active #get_active_sheet()
             # write header
             if PythonVersion < 3:
@@ -968,22 +1060,23 @@ class mdf(mdf3, mdf4):
             # arrange data
             for j in range(maxCols):
                 data = self.getChannelData(channels[j])
-                if data.ndim <= 1: # not an array channel
-                    if data.dtype.kind in ('i', 'u') or 'f4' in data.dtype.str:
-                        for r in range(len(data)):
-                            ws.cell(row=r + 3, column=j+1).value = float64(data[r])
-                    elif data.dtype.kind not in ('V', 'U'):
-                        for r in range(len(data)):
-                            ws.cell(row=r + 3, column=j+1).value = data[r]
+                try:
+                    if data.ndim <= 1: # not an array channel
+                        if data.dtype.kind in ('i', 'u') or 'f4' in data.dtype.str:
+                            for r in range(len(data)):
+                                ws.cell(row=r + 3, column=j+1).value = float64(data[r])
+                        elif data.dtype.kind not in ('V', 'U'):
+                            for r in range(len(data)):
+                                ws.cell(row=r + 3, column=j+1).value = data[r]
+                except IllegalCharacterError:
+                    print('could not export ' + channels[j])
         else:  # resampled data
-            wb = openpyxl.workbook.Workbook(optimized_write=True, encoding='utf-8')
+            wb = openpyxl.workbook.Workbook()
             ws = wb.create_sheet()
             # write header
             ws.append(channels)
-            ws.append([self.getChannelUnit(channel) for channel in list(self.keys())])
+            ws.append([self.getChannelUnit(channel) for channel in channels])
             # write data
-            maxRows = max([len(self.getChannelData(channel)) for channel in list(self.keys())])  # find max column length
-            maxCols = len(list(self.keys()))  # number of columns
             bigmat = zeros(maxRows)  # create empty column
             buf = bigmat
             for col in range(maxCols):
@@ -1002,7 +1095,7 @@ class mdf(mdf3, mdf4):
                         bigmat = vstack((bigmat, buf))
             bigmat = delete(bigmat, 0, 0)
             [ws.append(list(bigmat[:, row])) for row in range(maxRows)]
-        print('Writing file, please wait')
+        print('Writing file, please wait', file=stderr)
         wb.save(filename)
 
     def keepChannels(self, channelList):
@@ -1015,8 +1108,9 @@ class mdf(mdf3, mdf4):
         """
         channelList = [channel for channel in channelList]
         removeChannels = []
+        channelSet = set(channelList)
         for channel in list(self.keys()):
-            if channel not in channelList and 'master' not in channel and channel not in list(self.masterChannelList.keys()):
+            if channel not in channelSet and masterField not in channel and channel not in set(self.masterChannelList.keys()):
                 # avoid to remove master channels otherwise problems with resample
                 removeChannels.append(channel)
         if not len(removeChannels) == 0:
@@ -1063,6 +1157,26 @@ class mdf(mdf3, mdf4):
                 refill.fill(nan)  # fill with NANs
                 self.setChannelData(channel, hstack((data, refill)))
 
+    def copy(self):
+        """copy a mdf class
+
+        Returns:
+        ------------
+        mdf class instance
+            copy of a mdf class
+        """
+        yop = mdf()
+        yop.multiProc = self.multiProc
+        yop.fileName = self.fileName
+        yop.masterChannelList = self.masterChannelList
+        yop.file_metadata = self.file_metadata
+        yop.MDFVersionNumber = self.MDFVersionNumber
+        yop.filterChannelNames = self.filterChannelNames
+        yop.convert_tables = self.convert_tables
+        for channel in list(self.keys()):
+            yop[channel] = self[channel]
+        return yop
+
     def convertToPandas(self, sampling=None):
         """converts mdf data structure into pandas dataframe(s)
 
@@ -1083,7 +1197,7 @@ class mdf(mdf3, mdf4):
             raise ImportError('Module pandas missing')
         if sampling is not None:
             self.resample(sampling)
-        if self.file_metadata['date'] != '' and self.file_metadata['time']!='':
+        if self.file_metadata['date'] != '' and self.file_metadata['time'] != '':
             date = self.file_metadata['date'].replace(':', '-')
             time = self.file_metadata['time']
             datetimeInfo = datetime64(date + 'T' + time)
@@ -1092,13 +1206,15 @@ class mdf(mdf3, mdf4):
         originalKeys = list(self.keys())
         for group in list(self.masterChannelList.keys()):
             if group not in self.masterChannelList[group]:
-                print('no master channel in group ' + group)
-            elif self.getChannelMasterType(group)!=1:
-                print('Warning: master channel is not time, not appropriate conversion for pandas')
+                print('no master channel in group ' + group, file=stderr)
+            elif self.getChannelMasterType(group) != 1:
+                print('Warning: master channel is not time, \
+                      not appropriate conversion for pandas', file=stderr)
             temp = {}
             # convert time channel into timedelta
             if group in self.masterChannelList[group]:
-                time = datetimeInfo + array(self.getChannelData(group) * 1E6, dtype='timedelta64[us]')
+                time = datetimeInfo + array(self.getChannelData(group) * 1E6,
+                                            dtype='timedelta64[us]')
                 for channel in self.masterChannelList[group]:
                     data = self.getChannelData(channel)
                     if data.ndim == 1 and data.shape == time.shape:
@@ -1112,8 +1228,8 @@ class mdf(mdf3, mdf4):
                         temp[channel] = pd.Series(data)
                 self[group + '_group'] = pd.DataFrame(temp)
         # clean rest of self from data and time channel information
-        [self[channel].pop('data') for channel in originalKeys]
-        [self[channel].pop('master') for channel in originalKeys if 'master' in self[channel]]
+        [self[channel].pop(dataField) for channel in originalKeys]
+        [self[channel].pop(masterField) for channel in originalKeys if masterField in self[channel]]
         self.masterGroups = []  # save time groups name in list
         [self.masterGroups.append(group + '_group') for group in list(self.masterChannelList.keys())]
         self.masterChannelList = {}
@@ -1127,7 +1243,7 @@ if __name__ == "__main__":
         None
     parser = ArgumentParser(prog='mdfreader', description='reads mdf file')
     parser.add_argument('--export', dest='export', default=None, \
-            choices=['CSV', 'HDF5', 'Matlab', 'Xlsx', 'Excel', 'NetCDF', 'MDF3'], \
+            choices=['CSV', 'HDF5', 'Matlab', 'Xlsx', 'Excel', 'NetCDF', 'MDF'], \
             help='Export after parsing to defined file type')
     parser.add_argument('--list_channels', dest='list_channels', action='store_true', \
             help='list of channels in file')
@@ -1142,11 +1258,19 @@ if __name__ == "__main__":
     parser.add_argument('--filterChannelNames', action='store_true', \
             help='activates channel name filtering; \
             removes modules names separated by a point character')
+    parser.add_argument('--noDataLoading', action='store_true', \
+            help='Do not load data in memory, creates dummy \
+            mdf structure and load data from file when needed')
+    parser.add_argument('--compression', action='store_true', \
+            help='compress data in memory')
 
     args = parser.parse_args()
 
-    temp = mdf(fileName=args.fileName, channelList=args.channelList)
-    #, converAfterRead=args.convertAfterRead, filterChannelNames=args.filterChannelNames)
+    temp = mdf(fileName=args.fileName, channelList=args.channelList \
+        , converAfterRead=args.convertAfterRead, \
+        filterChannelNames=args.filterChannelNames, \
+        noDataLoading=args.noDataLoading, \
+        compression=args.compression)
     if args.export is not None:
         if args.export == 'CSV':
             temp.exportToCSV()
@@ -1160,9 +1284,9 @@ if __name__ == "__main__":
             temp.exportToExcel()
         elif args.export == 'NetCDF':
             temp.exportToNetCDF()
-        elif args.export == 'MDF3':
+        elif args.export == 'MDF':
             temp.write()
     if args.plot_channel_list is not None:
         temp.plot(args.plot_channel_list)
     if args.list_channels:
-        print(temp.masterChannelList)
+        print(temp.masterChannelList, file=stderr)
